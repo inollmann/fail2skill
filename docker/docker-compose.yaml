@@ -1,0 +1,115 @@
+# Use through ../al.sh, which sets up X11 access and builds the Isaac Lab base image first.
+# Settings: docker/.env (defaults, committed) and docker/.env.local (per machine/user, not committed).
+name: panda-al-${USER:-user}
+
+x-gpu: &gpu
+  resources:
+    reservations:
+      devices:
+        - driver: nvidia
+          device_ids: ["${AL_GPU:-0}"]
+          capabilities: [gpu]
+
+x-display-env: &display-env
+  DISPLAY: ${DISPLAY:-}
+  XAUTHORITY: /tmp/.panda_al.xauth
+  QT_X11_NO_MITSHM: "1"
+
+x-display-volumes: &display-volumes
+  - /tmp/.X11-unix:/tmp/.X11-unix
+  - ./.panda_al.xauth:/tmp/.panda_al.xauth:ro
+
+services:
+  # Isaac Lab + panda_al. `./al.sh shell` / `./al.sh generate ...` run one-off commands in it.
+  sim:
+    image: panda-al-sim:${AL_IMAGE_TAG:-latest}
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.sim
+      args:
+        ISAACLAB_BASE_IMAGE: ${ISAACLAB_BASE_IMAGE:-isaac-lab-base:latest}
+    profiles: [sim]
+    network_mode: host
+    init: true
+    stdin_open: true
+    tty: true
+    environment:
+      <<: *display-env
+      ACCEPT_EULA: "Y"
+      PRIVACY_CONSENT: "Y"
+      AL_DATA_DIR: /workspace/data
+      AL_BRIDGE_PORT: ${AL_BRIDGE_PORT:-45210}
+      AL_POLICY_HOST: ${AL_POLICY_HOST:-127.0.0.1}
+      AL_POLICY_PORT: ${AL_POLICY_PORT:-8000}
+    volumes:
+      - ../src:/workspace/panda_cosmos_al/src
+      - ../scripts:/workspace/panda_cosmos_al/scripts
+      - ../assets:/workspace/panda_cosmos_al/assets:ro
+      - ../tests:/workspace/panda_cosmos_al/tests
+      - ${AL_DATA:-../data}:/workspace/data
+      # Isaac Sim caches (shaders, assets, warp kernels) survive container restarts
+      - kit-cache:/isaac-sim/kit/cache
+      - kit-data:/isaac-sim/kit/data
+      - ov-cache:/root/.cache/ov
+      - gl-cache:/root/.cache/nvidia/GLCache
+      - compute-cache:/root/.nv/ComputeCache
+      - warp-cache:/root/.cache/warp
+      - /tmp/.X11-unix:/tmp/.X11-unix
+      - ./.panda_al.xauth:/tmp/.panda_al.xauth:ro
+    deploy: *gpu
+
+  # The simulator running the MoveIt teleop bridge server.
+  teleop-sim:
+    extends: sim
+    profiles: [teleop]
+    command: ["bash", "-c", "isaaclab -p scripts/teleop_moveit.py ${AL_SIM_VIEW:-}"]
+
+  # ROS 2 Humble: MoveIt 2 + RViz + al_ros_bridge.
+  moveit:
+    image: panda-al-ros:${AL_IMAGE_TAG:-latest}
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.ros
+      additional_contexts:
+        multipanda: ${MULTIPANDA_CONTEXT:-https://github.com/tenfoldpaper/multipanda_ros2.git#humble}
+    profiles: [teleop]
+    network_mode: host
+    ipc: host
+    init: true
+    stdin_open: true
+    tty: true
+    environment:
+      <<: *display-env
+      ROS_DOMAIN_ID: ${ROS_DOMAIN_ID:-42}
+      AL_BRIDGE_HOST: 127.0.0.1
+      AL_BRIDGE_PORT: ${AL_BRIDGE_PORT:-45210}
+      NVIDIA_DRIVER_CAPABILITIES: all
+    volumes: *display-volumes
+    deploy: *gpu
+
+  # Policy server (LeRobot). `./al.sh serve lerobot --checkpoint ...`; openpi policies use openpi's own server.
+  policy:
+    image: panda-al-policy:${AL_IMAGE_TAG:-latest}
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.policy
+    profiles: [policy]
+    network_mode: host
+    init: true
+    environment:
+      AL_POLICY_PORT: ${AL_POLICY_PORT:-8000}
+      HF_TOKEN: ${HF_TOKEN:-}
+    volumes:
+      - ../src:/workspace/panda_cosmos_al/src
+      - ${AL_DATA:-../data}:/workspace/data
+      - hf-cache:/root/.cache/huggingface
+    deploy: *gpu
+
+volumes:
+  hf-cache:
+  kit-cache:
+  kit-data:
+  ov-cache:
+  gl-cache:
+  compute-cache:
+  warp-cache:

@@ -1,0 +1,16 @@
+# Policy server: LeRobot (SmolVLA, ACT, diffusion, pi0/pi0.5 ports, ...) + panda_al.policy.serve.
+# Runs on any CUDA GPU (no RT cores needed), e.g. the H100 server. `./al.sh build policy`, `./al.sh serve ...`.
+FROM python:3.12-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends git && rm -rf /var/lib/apt/lists/*
+
+ARG LEROBOT_VERSION=0.6.1
+RUN pip install --no-cache-dir "lerobot[smolvla]==${LEROBOT_VERSION}"
+
+WORKDIR /workspace/panda_cosmos_al
+COPY pyproject.toml README.md ./
+COPY src src
+RUN pip install --no-cache-dir -e .
+
+ENTRYPOINT ["python", "-m", "panda_al.policy.serve"]
+CMD ["--help"]

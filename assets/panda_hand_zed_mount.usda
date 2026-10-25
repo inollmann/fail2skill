@@ -1,0 +1,55 @@
+#usda 1.0
+(
+    defaultPrim = "ZedMount"
+    metersPerUnit = 1
+    upAxis = "Z"
+)
+
+def Xform "ZedMount" (
+    doc = "Franka_Hand_ZED_mini_Mount + zed_mini in metres. The frame is the CAD frame of the mount, which is intended to coincide with panda_hand (z towards the fingers) up to the offset set in the env config."
+)
+{
+    def Xform "mount" (
+        prepend references = @./Franka_Hand_ZED_mini_Mount.usdc@</Franka_Hand_ZED_mini_Mount>
+    )
+    {
+        float3 xformOp:scale = (0.001, 0.001, 0.001)
+        uniform token[] xformOpOrder = ["xformOp:scale"]
+
+        over "MeshInstance" (
+            active = false
+        )
+        {
+        }
+
+        over "MeshInstance_1"
+        {
+            over "Körper1" (
+                prepend apiSchemas = ["PhysicsCollisionAPI", "PhysicsMeshCollisionAPI"]
+            )
+            {
+                uniform token physics:approximation = "convexHull"
+            }
+        }
+
+        over "MeshInstance_2"
+        {
+            over "Körper1" (
+                prepend apiSchemas = ["PhysicsCollisionAPI", "PhysicsMeshCollisionAPI"]
+            )
+            {
+                uniform token physics:approximation = "convexHull"
+            }
+        }
+    }
+
+    def Xform "zed_mini" (
+        prepend references = @./zed_mini.usd@
+    )
+    {
+        quatf xformOp:orient = (0.70710677, 0, 0, -0.70710677)
+        double3 xformOp:translate = (-0.051000000000000004, 0.00017, 0.06325)
+        uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:orient"]
+    }
+}
+

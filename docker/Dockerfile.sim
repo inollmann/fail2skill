@@ -1,0 +1,23 @@
+# Isaac Lab + this project. Built on the isaac-lab-base image from the pinned Isaac Lab checkout
+# (``./al.sh build`` builds both).
+ARG ISAACLAB_BASE_IMAGE=isaac-lab-base:latest
+FROM ${ISAACLAB_BASE_IMAGE}
+
+ENV AL_PATH=/workspace/panda_cosmos_al \
+    AL_DATA_DIR=/workspace/data
+
+USER root
+RUN mkdir -p ${AL_PATH} ${AL_DATA_DIR} && chown isaaclab:isaaclab ${AL_PATH} ${AL_DATA_DIR}
+USER isaaclab
+
+# install the package (editable, so the bind-mounted src/ is picked up during development)
+COPY --chown=isaaclab:isaaclab pyproject.toml README.md ${AL_PATH}/
+COPY --chown=isaaclab:isaaclab src ${AL_PATH}/src
+RUN --mount=type=cache,target=/root/.cache/uv,uid=1000,gid=1000 \
+    uv pip install --python ${VIRTUAL_ENV}/bin/python -e ${AL_PATH}
+COPY --chown=isaaclab:isaaclab scripts ${AL_PATH}/scripts
+COPY --chown=isaaclab:isaaclab tests ${AL_PATH}/tests
+
+WORKDIR ${AL_PATH}
+ENTRYPOINT []
+CMD ["bash"]

@@ -1,0 +1,31 @@
+[build-system]
+requires = ["uv_build>=0.12.6,<0.13"]
+build-backend = "uv_build"
+
+[project]
+name = "panda_al"
+version = "0.1.0"
+description = "Active-learning data pipeline for a Franka Panda in Isaac Lab: MoveIt teleop, scripted failures, dashcam."
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+# Isaac Lab itself is provided by the isaac-lab-base image; only extra dependencies are listed here.
+dependencies = ["av>=14", "numpy", "msgpack>=1.0", "pillow", "websockets>=13"]
+
+[project.entry-points."isaaclab.tasks"]
+panda_al = "panda_al.tasks"
+
+[tool.uv.build-backend]
+module-name = "panda_al"
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.ruff.lint.per-file-ignores]
+"scripts/**/*.py" = ["E402"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

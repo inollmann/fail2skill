@@ -1,0 +1,30 @@
+# ROS 2 Humble + MoveIt 2 with the Panda description / MoveIt config from multipanda_ros2,
+# plus the al_ros_bridge package. The multipanda sources come from the "multipanda" build
+# context (upstream git by default, or a local checkout; see docker/.env).
+FROM osrf/ros:humble-desktop
+
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ros-humble-moveit \
+        ros-humble-moveit-planners-ompl \
+        ros-humble-moveit-simple-controller-manager \
+        ros-humble-control-msgs \
+        ros-humble-xacro \
+        ros-humble-robot-state-publisher \
+        python3-colcon-common-extensions \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /ws
+COPY --from=multipanda franka_description src/franka_description
+COPY --from=multipanda franka_moveit_config src/franka_moveit_config
+COPY ros/al_ros_bridge src/al_ros_bridge
+RUN source /opt/ros/humble/setup.bash \
+    && colcon build --packages-select franka_description franka_moveit_config al_ros_bridge \
+    && rm -rf build log
+
+COPY docker/ros_entrypoint.sh /al_entrypoint.sh
+RUN echo "source /ws/install/setup.bash" >> /root/.bashrc
+ENTRYPOINT ["/al_entrypoint.sh"]
+CMD ["ros2", "launch", "al_ros_bridge", "moveit_isaac.launch.py"]
