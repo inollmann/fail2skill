@@ -24,6 +24,13 @@ HAND_TO_TCP = 0.1034
 """Distance from ``panda_hand`` to the fingertip center along the hand z-axis [m] (matches the env's ee_frame)."""
 
 CUBE_SIZE = 0.0468
+OBSTACLE = "obstacle"
+"""Scene entity name of the cylinder obstacle."""
+OBSTACLE_MODE = "obstacle_cylinder"
+OBSTACLE_HEIGHT = 0.18
+OBSTACLE_RADIUS = CUBE_SIZE / 2
+OBSTACLE_PARK_POS = (0.45, 0.0, -0.5)
+"""Where the obstacle waits when not used (robot base frame): under the table top, out of sight and out of reach."""
 SAFE_HEIGHT = 0.15
 """TCP height above the table for lifting and transport [m]."""
 
@@ -60,6 +67,16 @@ class Corruption:
     """Std of Gaussian noise added to the arm joint targets every step [rad]."""
     speed_scale: float = 1.0
     """Scales all phase durations (< 1 is faster)."""
+    obstacle_radius: float = 0.0
+    """Radius [m] of the static cylinder obstacle standing on the table (0: no obstacle)."""
+    obstacle_height: float = 0.0
+    """Height [m] of the obstacle."""
+    obstacle_along: float = 0.5
+    """Position of the obstacle on the line from the pick cube (0) to the place cube (1)."""
+    obstacle_lateral: float = 0.0
+    """Offset of the obstacle perpendicular to that line [m] (the TCP travels straight along the line)."""
+    obstacle_position: list[float] = field(default_factory=lambda: [0.0, 0.0, 0.0])
+    """Resulting position of the obstacle's center, robot base frame [m]. Filled in when the obstacle is placed."""
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -85,6 +102,14 @@ CORRUPTION_MODES = {
     "misplace": lambda g: Corruption(mode="misplace", place_offset=_random_xy(g, 0.035, 0.07)),
     "jitter": lambda g: Corruption(mode="jitter", joint_noise_std=_uniform(g, 0.02, 0.05)),
     "rushed": lambda g: Corruption(mode="rushed", speed_scale=_uniform(g, 0.25, 0.4)),
+    # the expert plan is not changed: it only fails if the arm or the carried cube actually hits the cylinder
+    OBSTACLE_MODE: lambda g: Corruption(
+        mode=OBSTACLE_MODE,
+        obstacle_radius=OBSTACLE_RADIUS,
+        obstacle_height=OBSTACLE_HEIGHT,
+        obstacle_along=_uniform(g, 0.4, 0.6),
+        obstacle_lateral=_uniform(g, -0.05, 0.05),
+    ),
 }
 """Failure modes and the magnitude ranges they are sampled from. Extend freely."""
 
@@ -116,6 +141,8 @@ class ScriptedPickPlace:
         self.robot = env.scene["robot"]
         self.pick = env.scene[pick_object]
         self.place = env.scene[place_object]
+        self.obstacle = env.scene[OBSTACLE] if OBSTACLE in env.scene.keys() else None
+        self._obstacle_placed = [False] * self.num_envs
         self.arm_ids, _ = self.robot.find_joints([f"panda_joint{i}" for i in range(1, 8)], preserve_order=True)
         self.hand_id = self.robot.find_bodies("panda_hand")[0][0]
         # fixed-base robot: the root body is not part of the Jacobian
@@ -155,10 +182,45 @@ class ScriptedPickPlace:
             self.release_at[env_id] = corruption.release_at
             self.joint_noise_std[env_id] = corruption.joint_noise_std
             self.durations[env_id] = torch.tensor([p[1] for p in PHASES], device=self.device) * corruption.speed_scale
+        self._place_obstacles(env_ids, corruptions)
         ids = torch.as_tensor(env_ids, device=self.device, dtype=torch.long)
         self.phase[ids] = 0
         self.phase_time[ids] = 0.0
         self.planned[ids] = False
+
+    def _place_obstacles(self, env_ids: list[int], corruptions: list[Corruption]):
+        """Stand the obstacle between the cubes (``obstacle_cylinder``) or park it. Uses the cube poses the env
+        reset just assigned, and fills ``corruption.obstacle_position``. Callers that snapshot the initial
+        state (the dashcam) have to do it again afterwards."""
+        if self.obstacle is None:
+            return
+        pick, _ = self._object_pose_b(self.pick)
+        place, _ = self._object_pose_b(self.place)
+        root = self.robot.data.root_pose_w.torch
+        positions = []
+        for env_id, corruption in zip(env_ids, corruptions, strict=True):
+            if corruption.mode == OBSTACLE_MODE:
+                line = (place[env_id] - pick[env_id])[:2]
+                perp = torch.stack([-line[1], line[0]]) / line.norm()
+                xy = pick[env_id, :2] + corruption.obstacle_along * line + corruption.obstacle_lateral * perp
+                pos_b = torch.cat([xy, xy.new_tensor([corruption.obstacle_height / 2])])
+                corruption.obstacle_position = [round(v, 5) for v in pos_b.tolist()]
+            else:
+                pos_b = torch.tensor(OBSTACLE_PARK_POS, device=self.device)
+            positions.append(root[env_id, :3] + quat_apply(root[env_id, 3:7], pos_b))
+        ids = torch.as_tensor(env_ids, device=self.device, dtype=torch.long)
+        quat = torch.tensor([0.0, 0.0, 0.0, 1.0], device=self.device).repeat(len(env_ids), 1)
+        pose = torch.cat([torch.stack(positions), quat], dim=-1)
+        self.obstacle.write_root_pose_to_sim_index(root_pose=pose, env_ids=ids)
+        used = [c.mode == OBSTACLE_MODE for c in corruptions]
+        moved = any(used) or any(self._obstacle_placed[i] for i in env_ids)
+        for env_id, is_used in zip(env_ids, used, strict=True):
+            self._obstacle_placed[env_id] = is_used
+        if moved:
+            # the cameras were rendered at the reset, before the obstacle moved
+            self.env.sim.forward()
+            for _ in range(self.env.cfg.num_rerenders_on_reset):
+                self.env.sim.render()
 
     def _hand_pose_b(self) -> tuple[torch.Tensor, torch.Tensor]:
         root = self.robot.data.root_pose_w.torch

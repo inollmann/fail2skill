@@ -16,13 +16,14 @@ import math
 from pathlib import Path
 
 import isaaclab.sim as sim_utils
-from isaaclab.assets import AssetBaseCfg
+from isaaclab.assets import AssetBaseCfg, RigidObjectCfg
 from isaaclab.managers import EventTermCfg as EventTerm
 from isaaclab.managers import ObservationGroupCfg as ObsGroup
 from isaaclab.managers import ObservationTermCfg as ObsTerm
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.managers import TerminationTermCfg as DoneTerm
-from isaaclab.sensors import CameraCfg
+from isaaclab.envs.mdp import illegal_contact
+from isaaclab.sensors import CameraCfg, ContactSensorCfg
 from isaaclab.utils import configclass
 from isaaclab_tasks.contrib.stack import mdp
 from isaaclab_tasks.contrib.stack.config.franka.stack_joint_pos_env_cfg import FrankaCubeStackEnvCfg
@@ -30,6 +31,7 @@ from isaaclab_tasks.contrib.stack.mdp import stack_events
 from isaaclab_tasks.utils.presets import set_isaac_rtx_global_settings
 
 from ..dashcam import DashcamRecorderManagerCfg
+from ..scripted import OBSTACLE, OBSTACLE_HEIGHT, OBSTACLE_PARK_POS, OBSTACLE_RADIUS
 
 TASK_NAME = "PandaAL-PickPlace-v0"
 INSTRUCTION = "Pick up the red cube and place it on top of the blue cube."
@@ -155,6 +157,10 @@ class TerminationsCfg:
     place_object_dropped = DoneTerm(
         func=mdp.root_height_below_minimum, params={"minimum_height": -0.05, "asset_cfg": SceneEntityCfg(PLACE_OBJECT)}
     )
+    # anything touching the obstacle cylinder (robot, carried cube): the episode ends and is filed as a failure
+    obstacle_collision = DoneTerm(
+        func=illegal_contact, params={"threshold": 1.0, "sensor_cfg": SceneEntityCfg("obstacle_contact")}
+    )
     # red on blue, gripper released and cubes at rest
     success = DoneTerm(
         func=mdp.cubes_stacked,
@@ -201,6 +207,25 @@ class PandaPickPlaceEnvCfg(FrankaCubeStackEnvCfg):
 
         # scene: two cubes only
         self.scene.cube_3 = None
+        # static cylinder obstacle: parked out of sight and placed between the cubes by the scripted expert's
+        # ``obstacle_cylinder`` corruption (see panda_al.scripted)
+        self.scene.obstacle = RigidObjectCfg(
+            prim_path=f"{{ENV_REGEX_NS}}/{OBSTACLE.capitalize()}",
+            init_state=RigidObjectCfg.InitialStateCfg(pos=OBSTACLE_PARK_POS),
+            spawn=sim_utils.CylinderCfg(
+                radius=OBSTACLE_RADIUS,
+                height=OBSTACLE_HEIGHT,
+                axis="Z",
+                rigid_props=sim_utils.RigidBodyPropertiesCfg(kinematic_enabled=True),
+                collision_props=sim_utils.CollisionPropertiesCfg(),
+                visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.85, 0.35, 0.05)),
+                activate_contact_sensors=True,
+            ),
+        )
+        # a PhysX contact history spanning the physics steps of one control step, so no touch is missed
+        self.scene.obstacle_contact = ContactSensorCfg(
+            prim_path=f"{{ENV_REGEX_NS}}/{OBSTACLE.capitalize()}", history_length=self.decimation, update_period=0.0
+        )
         self.scene.table = AssetBaseCfg(
             prim_path="{ENV_REGEX_NS}/Table",
             init_state=AssetBaseCfg.InitialStateCfg(pos=TABLE_POS, rot=(0.0, 0.0, 0.0, 1.0)),

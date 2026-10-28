@@ -71,6 +71,7 @@ def main():
         def start(env_ids: list[int]):
             corruptions = [new_corruption() for _ in env_ids]
             expert.reset(env_ids, corruptions)
+            dashcam.snapshot_initial_state(env_ids)  # the expert may have placed an obstacle
             for env_id, corruption in zip(env_ids, corruptions, strict=True):
                 dashcam.episode_extra[env_id] = {
                     "generator": "scripted",

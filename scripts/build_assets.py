@@ -13,6 +13,11 @@ Outputs (generated, committed):
 midpoint between the two lenses on the lens plane. The simplified camera body of the mount CAD is reused
 as its visual so that it fits the cradle of the mount exactly.
 
+The mount CAD was exported as the mirror image of the real part. Both assets are therefore built from the CAD
+reflected about the y = ``LENS_CENTER_CAD[1]`` plane (the plane through the lens pair and the screw hole, i.e. the
+plane the mount is nearly symmetric about, so the pose tuned for the unmirrored model stays valid). Set
+``MIRROR_CAD_Y = False`` to build from the CAD as it is.
+
 Where the mount sits on the hand is *not* part of the assets, see ``MOUNT_POS`` / ``MOUNT_ROT`` in
 ``panda_al/tasks/pick_place_env_cfg.py``.
 """
@@ -41,6 +46,7 @@ LENS_RADIUS = 0.0095
 # --- where the CAD's lenses are (mount CAD coordinates, mm); the lens plane is the top of the barrels
 LENS_CENTER_CAD = np.array([-51.0, 0.17, 63.25])
 # CAD frame (z along the lens axis, y along the baseline) -> ROS optical frame: x = -y, y = x, z = z
+MIRROR_CAD_Y = True
 CAD_TO_OPTICAL = np.array([[0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]])
 
 
@@ -49,6 +55,18 @@ def mesh_world_points(prim: Usd.Prim) -> tuple[np.ndarray, np.ndarray]:
     pts = np.array(mesh.GetPointsAttr().Get(), dtype=np.float64)
     xf = np.array(UsdGeom.Xformable(prim).ComputeLocalToWorldTransform(0)).T
     return (xf @ np.c_[pts, np.ones(len(pts))].T).T[:, :3], xf[:3, :3]
+
+
+def mirror_y_mm(points: np.ndarray) -> np.ndarray:
+    """Reflect CAD points (mm) about the plane y = LENS_CENTER_CAD[1]."""
+    out = points.copy()
+    out[..., 1] = 2.0 * LENS_CENTER_CAD[1] - out[..., 1]
+    return out
+
+
+def flip_winding(face_vertex_indices) -> np.ndarray:
+    """Restore outward orientation of triangles after a reflection (swap the 2nd and 3rd vertex of each)."""
+    return np.array(face_vertex_indices, dtype=np.int32).reshape(-1, 3)[:, [0, 2, 1]].reshape(-1)
 
 
 def preview_material(stage: Usd.Stage, path: str, color, roughness: float, metallic: float = 0.0):
@@ -71,8 +89,11 @@ def build_zed_mini(out: Path):
     cad = Usd.Stage.Open(str(MOUNT_CAD))
     cad_mesh = cad.GetPrimAtPath("/Franka_Hand_ZED_mini_Mount/MeshInstance/Körper1")
     pts_mm, rot = mesh_world_points(cad_mesh)
-    pts = (CAD_TO_OPTICAL @ (pts_mm - LENS_CENTER_CAD).T).T * MM
     src = UsdGeom.Mesh(cad_mesh)
+    indices = np.array(src.GetFaceVertexIndicesAttr().Get(), dtype=np.int32)
+    if MIRROR_CAD_Y:
+        pts_mm, indices = mirror_y_mm(pts_mm), flip_winding(indices)
+    pts = (CAD_TO_OPTICAL @ (pts_mm - LENS_CENTER_CAD).T).T * MM
 
     stage = Usd.Stage.CreateNew(str(out))
     UsdGeom.SetStageUpAxis(stage, UsdGeom.Tokens.z)
@@ -95,7 +116,7 @@ def build_zed_mini(out: Path):
     body = UsdGeom.Mesh.Define(stage, "/zed_mini/body")
     body.CreatePointsAttr(Vt.Vec3fArray.FromNumpy(pts.astype(np.float32)))
     body.CreateFaceVertexCountsAttr(src.GetFaceVertexCountsAttr().Get())
-    body.CreateFaceVertexIndicesAttr(src.GetFaceVertexIndicesAttr().Get())
+    body.CreateFaceVertexIndicesAttr(Vt.IntArray.FromNumpy(indices))
     body.CreateSubdivisionSchemeAttr(UsdGeom.Tokens.none)
     body.CreateDoubleSidedAttr(False)
     ext = UsdGeom.Boundable.ComputeExtentFromPlugins(body, 0)
@@ -124,6 +145,32 @@ def build_zed_mini(out: Path):
     stage.GetRootLayer().Save()
 
 
+def mirror_mesh_override(src: Usd.Prim, over: Usd.Prim):
+    """Author the CAD mesh ``src`` reflected about the mirror plane as opinions on ``over`` (same local frame).
+
+    The reflection is applied in the CAD root frame and conjugated with the mesh's own transform, so the
+    prim keeps its xform ops and its subsets / material bindings / UVs (all indexed per face or per vertex).
+    """
+    mesh = UsdGeom.Mesh(src)
+    to_root = np.array(UsdGeom.Xformable(src).ComputeLocalToWorldTransform(0)).T  # local -> CAD root (mm)
+    lin = to_root[:3, :3]
+    scale = np.linalg.norm(lin[:, 0])
+    rot = lin / scale  # the transforms are rotation * uniform scale (+ translation)
+    pts = np.array(mesh.GetPointsAttr().Get(), dtype=np.float64)
+    root = (to_root @ np.c_[pts, np.ones(len(pts))].T).T[:, :3]
+    local = (np.linalg.inv(to_root) @ np.c_[mirror_y_mm(root), np.ones(len(pts))].T).T[:, :3]
+
+    flip = np.diag([1.0, -1.0, 1.0])
+    normals = np.array(mesh.GetNormalsAttr().Get(), dtype=np.float64)
+    normals = (rot.T @ flip @ rot @ normals.T).T  # n_local' = R^T M R n_local
+
+    mesh_over = UsdGeom.Mesh(over)
+    mesh_over.GetPointsAttr().Set(Vt.Vec3fArray.FromNumpy(local.astype(np.float32)))
+    mesh_over.GetNormalsAttr().Set(Vt.Vec3fArray.FromNumpy(normals.astype(np.float32)))
+    mesh_over.GetFaceVertexIndicesAttr().Set(Vt.IntArray.FromNumpy(flip_winding(mesh.GetFaceVertexIndicesAttr().Get())))
+    mesh_over.GetExtentAttr().Set(UsdGeom.Boundable.ComputeExtentFromPlugins(mesh_over, 0))
+
+
 def build_mount(out: Path):
     stage = Usd.Stage.CreateNew(str(out))
     UsdGeom.SetStageUpAxis(stage, UsdGeom.Tokens.z)
@@ -140,8 +187,12 @@ def build_mount(out: Path):
     UsdGeom.Xformable(mount).AddScaleOp().Set(Gf.Vec3f(MM, MM, MM))
     # the CAD includes a dummy camera: replaced by zed_mini
     stage.OverridePrim("/ZedMount/mount/MeshInstance").SetActive(False)
+    cad = Usd.Stage.Open(str(MOUNT_CAD))
     for name in ("MeshInstance_1", "MeshInstance_2"):
-        add_collision(stage.OverridePrim(f"/ZedMount/mount/{name}/Körper1"))
+        over = stage.OverridePrim(f"/ZedMount/mount/{name}/Körper1")
+        if MIRROR_CAD_Y:
+            mirror_mesh_override(cad.GetPrimAtPath(f"/Franka_Hand_ZED_mini_Mount/{name}/Körper1"), over)
+        add_collision(over)
 
     zed = UsdGeom.Xform.Define(stage, "/ZedMount/zed_mini")
     zed.GetPrim().GetReferences().AddReference("./zed_mini.usd")

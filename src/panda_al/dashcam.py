@@ -76,11 +76,18 @@ class DashcamRecorder(RecorderTerm):
     """
 
     def record_post_reset(self, env_ids: Sequence[int] | None):
-        # snapshot the initial scene state so the episode can be replayed exactly
+        self.snapshot_initial_state(env_ids)
+        return None, None
+
+    def snapshot_initial_state(self, env_ids: Sequence[int] | None = None):
+        """Store the current scene state as the initial state of the next episode, so it can be replayed exactly.
+
+        Called after every reset; drivers that change the scene right after the reset (e.g. the scripted
+        generator placing an obstacle between the cubes) call it again.
+        """
         state = self._env.scene.get_state(is_relative=True)
         for env_id in self._resolve(env_ids):
             self._initial_states[env_id] = flatten_state(_index_state(state, env_id))
-        return None, None
 
     def record_pre_step(self):
         if not self.enabled:

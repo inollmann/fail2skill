@@ -78,6 +78,21 @@ The failure modes are defined in `CORRUPTION_MODES` in `src/panda_al/scripted.py
 are stored in each episode's `meta.json`. A corrupted episode that still succeeds is filed as a success,
 because the label always comes from the simulator, not from the injected corruption.
 
+### Obstacle failures
+
+The corruption mode `obstacle_cylinder` stands a static cylinder (height 0.18 m, radius = cube side / 2) on the
+table between the two cubes. It is placed right after the env reset has randomized the cube poses, at a fraction
+0.4 - 0.6 along the line from the pick to the place cube and up to 5 cm to the side. The expert plan is not
+changed, so the episode only fails if the robot (or the carried cube) really touches the cylinder. Any contact
+ends the episode with the `obstacle_collision` termination and it is filed under `failure/`. The cylinder is
+stored in `meta.json` → `extra.corruption` (`obstacle_radius`, `obstacle_height`, `obstacle_along`,
+`obstacle_lateral`, resulting `obstacle_position` in the robot base frame) and in `initial_state.npz`, so replays
+contain it too. In all other episodes it waits under the table, out of sight.
+
+```bash
+./al.sh generate --modes obstacle_cylinder --corrupt_ratio 1 --num_episodes 20 --run_name obstacle
+```
+
 ### Replay / validate actions
 
 ```bash
