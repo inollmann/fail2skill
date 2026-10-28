@@ -18,11 +18,12 @@ Use cases:
 import argparse
 import json
 import os
+from pathlib import Path
 
 from isaaclab.app import add_launcher_args, launch_simulation
 
 parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-parser.add_argument("--task", default="PandaAL-PickPlace-v0")
+parser.add_argument("--task", default=None, help="Environment id (default: the one the episodes were recorded in).")
 parser.add_argument("--episodes", nargs="+", required=True, help="Episode directories to replay.")
 parser.add_argument("--actions", default=None, help="Optional (T, 8) .npy to execute instead of the recorded actions.")
 parser.add_argument("--run_name", default="replay", help="Episodes go to $AL_DATA_DIR/episodes/<run_name>.")
@@ -32,6 +33,12 @@ parser.add_argument(
 )
 add_launcher_args(parser)
 args_cli, hydra_overrides = parser.parse_known_args()
+
+if args_cli.task is None:
+    recorded = {json.loads((Path(p) / "meta.json").read_text())["task"] for p in args_cli.episodes}
+    if len(recorded) != 1:
+        parser.error(f"the episodes were recorded in different environments {sorted(recorded)}: pass --task")
+    args_cli.task = recorded.pop()
 
 import gymnasium as gym
 import isaaclab_tasks  # noqa: F401
@@ -76,6 +83,9 @@ def main():
             hold_steps = int(args_cli.hold_time / env.step_dt)
 
             env.reset_to(_to_torch(unflatten_state(episode.initial_state), env.device), env_ids, is_relative=True)
+            task_info = episode.meta.extra.get("task")
+            if task_info is not None and hasattr(env, "restore_episode_info"):
+                env.restore_episode_info([0], [task_info])  # multi-task env: task, prompt and goal of the episode
             dashcam.parent_episode[0] = episode.meta.episode_id
             dashcam.episode_extra[0] = {"replayed_from": str(path), "actions_file": args_cli.actions}
             done = False

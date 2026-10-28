@@ -139,10 +139,11 @@ class ScriptedPickPlace:
         self.num_envs = env.num_envs
         self.dt = env.step_dt
         self.robot = env.scene["robot"]
-        self.pick = env.scene[pick_object]
-        self.place = env.scene[place_object]
+        # multi-task envs choose pick and place object per env (env.task_state), single-task envs use fixed entities
+        self.dynamic = hasattr(env, "task_state")
+        self.pick = None if self.dynamic else env.scene[pick_object]
+        self.place = None if self.dynamic else env.scene[place_object]
         self.obstacle = env.scene[OBSTACLE] if OBSTACLE in env.scene.keys() else None
-        self._obstacle_placed = [False] * self.num_envs
         self.arm_ids, _ = self.robot.find_joints([f"panda_joint{i}" for i in range(1, 8)], preserve_order=True)
         self.hand_id = self.robot.find_bodies("panda_hand")[0][0]
         # fixed-base robot: the root body is not part of the Jacobian
@@ -165,6 +166,7 @@ class ScriptedPickPlace:
         self.durations = torch.tensor([p[1] for p in PHASES], device=d).repeat(n, 1)
         self.gripper_by_phase = torch.tensor([p[2] for p in PHASES], device=d)
         # per-env corruption parameters
+        self._up = torch.tensor([0.0, 0.0, 1.0], device=d)
         self.corruptions: list[Corruption] = [Corruption() for _ in range(n)]
         self.grasp_offset = torch.zeros(n, 3, device=d)
         self.grasp_yaw_offset = torch.zeros(n, device=d)
@@ -189,43 +191,24 @@ class ScriptedPickPlace:
         self.planned[ids] = False
 
     def _place_obstacles(self, env_ids: list[int], corruptions: list[Corruption]):
-        """Stand the obstacle between the cubes (``obstacle_cylinder``) or park it. Uses the cube poses the env
-        reset just assigned, and fills ``corruption.obstacle_position``. Callers that snapshot the initial
-        state (the dashcam) have to do it again afterwards."""
-        if self.obstacle is None:
-            return
-        pick, _ = self._object_pose_b(self.pick)
-        place, _ = self._object_pose_b(self.place)
-        root = self.robot.data.root_pose_w.torch
-        positions = []
-        for env_id, corruption in zip(env_ids, corruptions, strict=True):
-            if corruption.mode == OBSTACLE_MODE:
-                line = (place[env_id] - pick[env_id])[:2]
-                perp = torch.stack([-line[1], line[0]]) / line.norm()
-                xy = pick[env_id, :2] + corruption.obstacle_along * line + corruption.obstacle_lateral * perp
-                pos_b = torch.cat([xy, xy.new_tensor([corruption.obstacle_height / 2])])
-                corruption.obstacle_position = [round(v, 5) for v in pos_b.tolist()]
-            else:
-                pos_b = torch.tensor(OBSTACLE_PARK_POS, device=self.device)
-            positions.append(root[env_id, :3] + quat_apply(root[env_id, 3:7], pos_b))
-        ids = torch.as_tensor(env_ids, device=self.device, dtype=torch.long)
-        quat = torch.tensor([0.0, 0.0, 0.0, 1.0], device=self.device).repeat(len(env_ids), 1)
-        pose = torch.cat([torch.stack(positions), quat], dim=-1)
-        self.obstacle.write_root_pose_to_sim_index(root_pose=pose, env_ids=ids)
-        used = [c.mode == OBSTACLE_MODE for c in corruptions]
-        moved = any(used) or any(self._obstacle_placed[i] for i in env_ids)
-        for env_id, is_used in zip(env_ids, used, strict=True):
-            self._obstacle_placed[env_id] = is_used
-        if moved:
-            # the cameras were rendered at the reset, before the obstacle moved
-            self.env.sim.forward()
-            for _ in range(self.env.cfg.num_rerenders_on_reset):
-                self.env.sim.render()
+        """Stand the obstacle between the cubes (``obstacle_cylinder``) or park it; see :mod:`panda_al.obstacle`.
+        Callers that snapshot the initial state (the dashcam) have to do it again afterwards."""
+        from .obstacle import place_obstacles  # circular: obstacle imports Corruption from here
+
+        place_obstacles(self.env, env_ids, corruptions, self._role_pose_b)
 
     def _hand_pose_b(self) -> tuple[torch.Tensor, torch.Tensor]:
         root = self.robot.data.root_pose_w.torch
         hand = self.robot.data.body_pose_w.torch[:, self.hand_id]
         return subtract_frame_transforms(root[:, :3], root[:, 3:7], hand[:, :3], hand[:, 3:7])
+
+    def _role_pose_b(self, role: str) -> tuple[torch.Tensor, torch.Tensor]:
+        """Pose of the object to ``pick`` or the one to ``place`` it on / next to, robot base frame."""
+        if not self.dynamic:
+            return self._object_pose_b(self.pick if role == "pick" else self.place)
+        from .obstacle import task_state_role_pose
+
+        return task_state_role_pose(self.env, role)
 
     def _object_pose_b(self, obj) -> tuple[torch.Tensor, torch.Tensor]:
         root = self.robot.data.root_pose_w.torch
@@ -236,8 +219,8 @@ class ScriptedPickPlace:
     def _plan(self, ids: torch.Tensor, hand_pos: torch.Tensor, hand_quat: torch.Tensor):
         """Compute the waypoints of ``ids`` from the current object poses."""
         tcp_pos = hand_pos + quat_apply(hand_quat, torch.tensor([0.0, 0.0, HAND_TO_TCP], device=self.device))
-        pick_pos, pick_quat = self._object_pose_b(self.pick)
-        place_pos, _ = self._object_pose_b(self.place)
+        pick_pos, pick_quat = self._role_pose_b("pick")
+        place_pos, _ = self._role_pose_b("place")
         # top-down grasp; pick the cube yaw (mod 90 deg) closest to the current hand yaw
         _, _, hand_yaw = euler_xyz_from_quat(hand_quat)
         _, _, cube_yaw = euler_xyz_from_quat(pick_quat)
@@ -247,7 +230,9 @@ class ScriptedPickPlace:
         grasp_quat = quat_from_euler_xyz(roll, torch.zeros_like(yaw), yaw)
 
         grasp = pick_pos + self.grasp_offset
-        place = place_pos + self.place_offset + torch.tensor([0.0, 0.0, CUBE_SIZE + 0.01], device=self.device)
+        # where the pick object's center has to end up (on top of / next to the place object), then 1 cm of clearance
+        goal = self.env.task_state.target(place_pos) if self.dynamic else place_pos + CUBE_SIZE * self._up
+        place = goal + self.place_offset + 0.01 * self._up
         up = lambda p, z: torch.cat([p[:, :2], torch.full_like(p[:, 2:], z)], dim=-1)  # noqa: E731
         wp = torch.stack(
             [

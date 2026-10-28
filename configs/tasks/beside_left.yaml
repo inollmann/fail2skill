@@ -1,0 +1,10 @@
+name: beside_left
+goal: {type: beside, direction: left, distance: 0.10}   # left = robot's left (+y of the base frame)
+pick: {noun: cube}
+place: {noun: cube}
+distractors: [0, 1]
+time_limit_s: 20
+weight: 1.0
+prompts:
+  - "put the {pick.color} {pick.noun} to the left of the {place.color} {place.noun}"
+  - "move the {pick.color} {pick.noun} next to the {place.color} {place.noun}, on its left side"

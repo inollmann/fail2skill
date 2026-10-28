@@ -5,6 +5,7 @@ The env's action is always 8-D: 7 absolute arm joint position targets [rad] + gr
 
 from __future__ import annotations
 
+import io
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -36,6 +37,50 @@ def resize_with_pad(image: np.ndarray, height: int, width: int) -> np.ndarray:
     return out
 
 
+def encode_jpeg(image: np.ndarray, quality: int) -> dict:
+    """An RGB image as ``{"jpeg": bytes}``: about 20x smaller on the wire; the server decodes it (``decode_images``)."""
+    buffer = io.BytesIO()
+    Image.fromarray(image).save(buffer, format="JPEG", quality=quality)
+    return {"jpeg": buffer.getvalue()}
+
+
+def decode_images(tree, pool=None):
+    """Replace every ``{"jpeg": bytes}`` in a (nested) request by the decoded uint8 array. Other values are kept.
+
+    ``pool`` (a ``concurrent.futures.Executor``) decodes several images in parallel: PIL releases the GIL.
+    """
+    jobs: list = []
+
+    def walk(node):
+        if isinstance(node, dict):
+            if set(node) == {"jpeg"}:
+                jobs.append(node["jpeg"])
+                return len(jobs) - 1, True
+            return {k: walk(v) for k, v in node.items()}
+        if isinstance(node, list):
+            return [walk(v) for v in node]
+        return node
+
+    def decode(data: bytes) -> np.ndarray:
+        return np.asarray(Image.open(io.BytesIO(data)).convert("RGB"))
+
+    skeleton = walk(tree)
+    if not jobs:
+        return tree
+    decoded = list(pool.map(decode, jobs)) if pool is not None else [decode(j) for j in jobs]
+
+    def fill(node):
+        if isinstance(node, tuple) and len(node) == 2 and node[1] is True:
+            return decoded[node[0]]
+        if isinstance(node, dict):
+            return {k: fill(v) for k, v in node.items()}
+        if isinstance(node, list):
+            return [fill(v) for v in node]
+        return node
+
+    return fill(skeleton)
+
+
 @dataclass
 class PolicyAdapter:
     """Base class. ``request`` builds the observation dict sent to the server, ``to_env_action`` converts one
@@ -43,6 +88,12 @@ class PolicyAdapter:
 
     open_loop_horizon: int = 8
     """How many actions of each chunk are executed before the policy is queried again."""
+    jpeg_quality: int | None = None
+    """Send images as JPEG of this quality (1-100) instead of raw pixels: a remote server over Gigabit needs it
+    (a request for 16 envs is about 30 MB raw). Slightly lossy, like the H.264 videos the policies are trained on."""
+
+    def pack_image(self, image: np.ndarray):
+        return image if self.jpeg_quality is None else encode_jpeg(image, self.jpeg_quality)
 
     def camera_names(self) -> list[str]:
         """Cameras whose images ``request`` reads."""
@@ -73,7 +124,7 @@ class NativeAdapter(PolicyAdapter):
         return list(self.cameras)
 
     def request(self, obs: Observation) -> dict:
-        req = {f"observation/images/{name}": obs.images[name] for name in self.cameras}
+        req = {f"observation/images/{name}": self.pack_image(obs.images[name]) for name in self.cameras}
         req["observation/joint_position"] = obs.joint_position.astype(np.float32)
         req["observation/gripper_position"] = obs.gripper_position.astype(np.float32)
         req["observation/state"] = np.concatenate([obs.joint_position, obs.gripper_position]).astype(np.float32)
@@ -105,8 +156,10 @@ class DroidAdapter(PolicyAdapter):
     def request(self, obs: Observation) -> dict:
         size = self.image_size
         return {
-            "observation/exterior_image_1_left": resize_with_pad(obs.images[self.exterior_camera], size, size),
-            "observation/wrist_image_left": resize_with_pad(obs.images[self.wrist_camera], size, size),
+            "observation/exterior_image_1_left": self.pack_image(
+                resize_with_pad(obs.images[self.exterior_camera], size, size)
+            ),
+            "observation/wrist_image_left": self.pack_image(resize_with_pad(obs.images[self.wrist_camera], size, size)),
             "observation/joint_position": obs.joint_position.astype(np.float64),
             "observation/gripper_position": obs.gripper_position.astype(np.float64),
             "prompt": obs.instruction,

@@ -73,6 +73,14 @@ Data collection
                         (--gui also opens the Isaac Sim window; RViz is always shown)
   generate [args]       scripted episodes, e.g. ./al.sh generate --num_envs 8 --num_episodes 200
   replay [args]         replay episodes / validate actions, e.g. ./al.sh replay --episodes data/episodes/x/failure/*
+  export-lerobot [args] episodes -> LeRobotDataset for fine-tuning, e.g.
+                        ./al.sh export-lerobot --source data/episodes/demos --out data/lerobot/demos_v0
+  train [args]          fine-tune SmolVLA on such a dataset (LeRobot), e.g.
+                        ./al.sh train --dataset data/lerobot/demos_v0 --name smolvla_iter0 --steps 20000
+  report <run dirs>     success rates per task / failure tags from stats.jsonl of collection runs
+  collect <campaign>    unattended failure collection with a served policy (configs/campaigns/*.yaml);
+                        restarts the simulator after crashes and resumes from the files on disk
+  registry              validate assets/objects and configs/tasks and list what they define
   policy [args]         roll out a policy served over websocket, e.g. ./al.sh policy --adapter droid --num_episodes 20
   serve [args]          policy server (LeRobot image), e.g. ./al.sh serve lerobot --checkpoint <dir|repo>
                         or ./al.sh serve hold (smoke test). Paths below data/ are /workspace/data/...
@@ -81,7 +89,7 @@ Tools
   shell                 interactive shell in the sim container
   ros-shell             interactive shell in the ROS container
   run <cmd...>          run a command in the sim container (e.g. ./al.sh run isaaclab -p scripts/...)
-  test                  run the unit tests
+  test                  run the unit tests (simulator image); test-policy: LeRobot-dependent ones (policy image)
   logs                  follow the teleop container logs
   down                  stop all containers of this project
 
@@ -96,7 +104,7 @@ to_container_paths() {
     data="$(realpath "$AL_DATA")"
     for arg in "$@"; do
         abs="$(realpath -m -- "$arg")"
-        if [[ -e "$arg" && "$abs" == "$data"* ]]; then
+        if [[ "$abs" == "$data"* && ( -e "$arg" || "$arg" == */* ) ]]; then
             out+=("/workspace/data${abs#"$data"}")
         else
             out+=("$arg")
@@ -135,6 +143,40 @@ case "$cmd" in
         mapfile -t args < <(to_container_paths "$@")
         compose --profile sim run --rm sim isaaclab -p scripts/replay_episode.py "${args[@]}"
         ;;
+    collect)
+        prepare_runtime
+        [[ $# -ge 1 ]] || { echo "usage: ./al.sh collect configs/campaigns/<campaign>.yaml"; exit 2; }
+        tty_flag=(); [[ -t 0 ]] || tty_flag=(-T)   # unattended (nohup, ssh without tty)
+        # the isaaclab launcher turns every exit code into 1, so scripts/collect.py reports its status in a file
+        status_name=".collect_status_$$"
+        trap 'rm -f "$AL_DATA/$status_name"' EXIT
+        restarts=0
+        while true; do
+            rm -f "$AL_DATA/$status_name"
+            set +e
+            compose --profile sim run --rm "${tty_flag[@]}" -e AL_COLLECT_STATUS_FILE="/workspace/data/$status_name" \
+                sim isaaclab -p scripts/collect.py "$@"
+            set -e
+            code=1; [[ -f "$AL_DATA/$status_name" ]] && code="$(<"$AL_DATA/$status_name")"   # no file: crash
+            [[ $code -eq 0 || $code -eq 2 ]] && exit "$code"
+            restarts=$((restarts + 1))
+            if [[ $restarts -gt ${AL_COLLECT_MAX_RESTARTS:-20} ]]; then echo "[collect] too many restarts"; exit "$code"; fi
+            echo "[collect] exited with code $code, restarting in 30 s ($restarts/${AL_COLLECT_MAX_RESTARTS:-20})"
+            sleep 30
+        done
+        ;;
+    export-lerobot)
+        prepare_runtime
+        mapfile -t args < <(to_container_paths "$@")
+        compose --profile policy run --rm --entrypoint python policy -m panda_al.export.lerobot_export "${args[@]}"
+        ;;
+    train)
+        prepare_runtime
+        mapfile -t args < <(to_container_paths "$@")
+        compose --profile policy run --rm --entrypoint python policy -m panda_al.train "${args[@]}"
+        ;;
+    report) python3 "$ROOT/scripts/report_stats.py" "$@" ;;
+    registry) prepare_runtime; compose --profile sim run --rm sim python scripts/check_registry.py "$@" ;;
     policy)
         prepare_runtime
         compose --profile sim run --rm sim isaaclab -p scripts/run_policy.py "$@"
@@ -147,6 +189,7 @@ case "$cmd" in
     ros-shell) prepare_runtime; compose --profile teleop run --rm moveit bash ;;
     run) prepare_runtime; compose --profile sim run --rm sim "$@" ;;
     test) prepare_runtime; compose --profile sim run --rm sim python -m pytest -q tests ;;
+    test-policy) prepare_runtime; compose --profile policy run --rm --entrypoint python policy -m pytest -q tests/test_export.py tests/test_policy.py ;;
     logs) compose --profile teleop logs -f ;;
     down) compose --profile sim --profile teleop down ;;
     help|-h|--help) usage ;;

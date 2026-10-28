@@ -10,6 +10,14 @@ x-gpu: &gpu
           device_ids: ["${AL_GPU:-0}"]
           capabilities: [gpu]
 
+x-policy-gpu: &policy-gpu   # the policy server / trainer: AL_POLICY_GPU, by default the same GPU as the simulator
+  resources:
+    reservations:
+      devices:
+        - driver: nvidia
+          device_ids: ["${AL_POLICY_GPU:-${AL_GPU:-0}}"]
+          capabilities: [gpu]
+
 x-display-env: &display-env
   DISPLAY: ${DISPLAY:-}
   XAUTHORITY: /tmp/.panda_al.xauth
@@ -45,6 +53,7 @@ services:
       - ../src:/workspace/panda_cosmos_al/src
       - ../scripts:/workspace/panda_cosmos_al/scripts
       - ../assets:/workspace/panda_cosmos_al/assets:ro
+      - ../configs:/workspace/panda_cosmos_al/configs:ro
       - ../tests:/workspace/panda_cosmos_al/tests
       - ${AL_DATA:-../data}:/workspace/data
       # Isaac Sim caches (shaders, assets, warp kernels) survive container restarts
@@ -96,14 +105,16 @@ services:
     profiles: [policy]
     network_mode: host
     init: true
+    shm_size: 8gb   # DataLoader workers pass batches (3 cameras x 640x360) through shared memory
     environment:
       AL_POLICY_PORT: ${AL_POLICY_PORT:-8000}
       HF_TOKEN: ${HF_TOKEN:-}
     volumes:
       - ../src:/workspace/panda_cosmos_al/src
+      - ../tests:/workspace/panda_cosmos_al/tests
       - ${AL_DATA:-../data}:/workspace/data
       - hf-cache:/root/.cache/huggingface
-    deploy: *gpu
+    deploy: *policy-gpu
 
 volumes:
   hf-cache:

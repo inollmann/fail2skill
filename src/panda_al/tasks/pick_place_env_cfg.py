@@ -17,12 +17,12 @@ from pathlib import Path
 
 import isaaclab.sim as sim_utils
 from isaaclab.assets import AssetBaseCfg, RigidObjectCfg
+from isaaclab.envs.mdp import illegal_contact
 from isaaclab.managers import EventTermCfg as EventTerm
 from isaaclab.managers import ObservationGroupCfg as ObsGroup
 from isaaclab.managers import ObservationTermCfg as ObsTerm
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.managers import TerminationTermCfg as DoneTerm
-from isaaclab.envs.mdp import illegal_contact
 from isaaclab.sensors import CameraCfg, ContactSensorCfg
 from isaaclab.utils import configclass
 from isaaclab_tasks.contrib.stack import mdp
@@ -122,6 +122,20 @@ def exterior_camera(name: str, eye: tuple[float, float, float], target=(0.5, 0.0
         spawn=sim_utils.PinholeCameraCfg(focal_length=18.0, horizontal_aperture=20.955, clipping_range=(0.05, 5.0)),
         offset=CameraCfg.OffsetCfg(pos=eye, rot=look_at_quat(eye, target), convention="world"),
     )
+
+
+def restrict_cameras(env_cfg: PandaPickPlaceEnvCfg, keep: list[str]) -> None:
+    """Remove every camera not in ``keep`` from the scene (and the dashcam). Fewer cameras means fewer rendered views."""
+    unknown = set(keep) - set(env_cfg.camera_names)
+    if unknown:
+        raise ValueError(f"unknown cameras {sorted(unknown)} (available: {env_cfg.camera_names})")
+    for name in env_cfg.camera_names:
+        if name not in keep:
+            setattr(env_cfg.scene, name, None)
+    env_cfg.camera_names = [name for name in env_cfg.camera_names if name in keep]
+    dashcam = env_cfg.recorders.dashcam
+    dashcam.camera_names = list(env_cfg.camera_names)
+    dashcam.depth_camera_names = [n for n in dashcam.depth_camera_names if n in keep]
 
 
 @configclass

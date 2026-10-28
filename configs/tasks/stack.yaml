@@ -1,0 +1,12 @@
+# Task definition, see docs/automated_collection.md.
+name: stack
+goal: {type: stack}               # pick object ends up on top of the place object
+pick: {noun: cube}                # filter on object properties (value or list of values)
+place: {noun: cube}
+distractors: [0, 1]               # min, max number of additional objects on the table
+time_limit_s: 25
+weight: 1.0
+prompts:
+  - "put the {pick.color} {pick.noun} on top of the {place.color} {place.noun}"
+  - "stack the {pick.color} {pick.noun} on the {place.color} {place.noun}"
+  - "pick up the {pick.color} {pick.noun} and place it on the {place.color} {place.noun}"

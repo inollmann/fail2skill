@@ -1,0 +1,13 @@
+# Pipeline test without any VLA: the scripted expert (half of the episodes corrupted) plays the policy.
+name: dryrun_expert
+driver: expert
+num_envs: 4
+expert: {corrupt_ratio: 0.5}
+tasks: {stack: 1.0, beside_left: 1.0, beside_right: 1.0}
+perturbations:
+  obstacle: {probability: 0.2}
+save:
+  outcomes: [failure]
+  drop_tags: []
+  quota: {per_task: 4}
+limits: {max_episodes: 60, max_hours: 1}

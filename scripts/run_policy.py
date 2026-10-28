@@ -16,7 +16,6 @@ resets stateful policies on our server.
 """
 
 import argparse
-import json
 import os
 
 from isaaclab.app import add_launcher_args, launch_simulation
@@ -44,56 +43,9 @@ import torch
 from isaaclab_tasks.utils.parse_cfg import parse_env_cfg
 
 import panda_al.tasks  # noqa: F401
-from panda_al.dashcam import PANDA_FINGER_OPEN, get_dashcam
-from panda_al.policy import Observation, PolicyClient
-
-
-def read_observations(env, camera_names: list[str], arm_ids: list[int], finger_id: int, instruction: str):
-    """One :class:`Observation` per env from the current sim state."""
-    images = {
-        name: env.scene[name].data.output["rgb"].torch[..., :3].to(torch.uint8).cpu().numpy() for name in camera_names
-    }
-    joint_pos = env.scene["robot"].data.joint_pos.torch
-    closure = 1.0 - (joint_pos[:, finger_id] / PANDA_FINGER_OPEN).clamp(0.0, 1.0)
-    arm = joint_pos[:, arm_ids].cpu().numpy().astype(np.float64)
-    closure = closure.cpu().numpy().astype(np.float64)
-    return [
-        Observation(
-            images={name: img[i] for name, img in images.items()},
-            joint_position=arm[i],
-            gripper_position=closure[i : i + 1],
-            instruction=instruction,
-        )
-        for i in range(env.num_envs)
-    ]
-
-
-class PolicyRunner:
-    """Chunked execution for one env: query, execute ``open_loop_horizon`` actions, query again."""
-
-    def __init__(self, adapter, host: str, port: int):
-        self.adapter, self.host, self.port = adapter, host, port
-        self.client: PolicyClient | None = None
-        self.queue: list[np.ndarray] = []
-
-    def start_episode(self) -> dict:
-        if self.client is not None:
-            self.client.close()
-        self.client = PolicyClient(self.host, self.port)
-        self.queue = []
-        # stored in meta.json: make sure it is plain JSON
-        return json.loads(json.dumps(self.client.metadata, default=str))
-
-    def act(self, obs: Observation) -> np.ndarray:
-        if not self.queue:
-            chunk = np.asarray(self.client.infer(self.adapter.request(obs))["actions"])
-            chunk = chunk.reshape(-1, chunk.shape[-1])
-            self.queue = list(chunk[: self.adapter.open_loop_horizon])
-        return self.adapter.to_env_action(self.queue.pop(0), obs)
-
-    def close(self):
-        if self.client is not None:
-            self.client.close()
+from panda_al.collect.drivers import read_observations
+from panda_al.dashcam import get_dashcam
+from panda_al.policy import PolicyRunner
 
 
 def main():
@@ -124,11 +76,11 @@ def main():
             for env_id in env_ids:
                 metadata = runners[env_id].start_episode()
                 dashcam.episode_extra[env_id] = {
-                    "policy": {"server": runners[env_id].client.uri, "metadata": metadata, **adapter.describe()}
+                    "policy": {"server": runners[env_id].uri, "metadata": metadata, **adapter.describe()}
                 }
 
         start(list(range(env.num_envs)))
-        print(f"[policy] connected to {runners[0].client.uri}: {runners[0].client.metadata}")
+        print(f"[policy] connected to {runners[0].uri}: {runners[0].client.metadata}")
         finished = {"success": 0, "failure": 0}
         while env.sim.is_running() and sum(finished.values()) < args_cli.num_episodes:
             observations = read_observations(env, adapter.camera_names(), arm_ids, finger_id, instruction)

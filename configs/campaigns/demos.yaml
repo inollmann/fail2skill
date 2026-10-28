@@ -1,0 +1,16 @@
+# Demonstrations for fine-tuning a VLA (milestone M4): the scripted expert, clean, successes only.
+# Positions, object colors, distractors and prompt phrasings are randomised by the multi-task env at every reset.
+# Run: ./al.sh collect configs/campaigns/demos.yaml  ->  ./al.sh export-lerobot --source data/episodes/demos --out data/lerobot/demos_v0
+name: demos
+driver: expert
+num_envs: 16
+seed: 100
+expert: {corrupt_ratio: 0.0}
+tasks: {stack: 1.0, beside_left: 1.0, beside_right: 1.0}
+cameras: [exterior_1, exterior_2, wrist]       # what the policy sees (the wrist depth and right lens are not needed)
+perturbations:
+  obstacle: {probability: 0.0}
+save:
+  outcomes: [success]
+  quota: {per_task: 150}
+limits: {max_hours: 4}

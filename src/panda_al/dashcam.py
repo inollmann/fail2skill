@@ -17,8 +17,8 @@ import os
 import socket
 import time
 import uuid
-from collections.abc import Sequence
-from dataclasses import MISSING
+from collections.abc import Callable, Sequence
+from dataclasses import MISSING, dataclass, field
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -28,13 +28,32 @@ from isaaclab.managers.recorder_manager import DatasetExportMode
 from isaaclab.utils import configclass
 from isaaclab.utils.math import euler_xyz_from_quat
 
-from .episode_io import EpisodeMeta, EpisodeWriter, flatten_state
+from .episode_io import EpisodeMeta, EpisodeWriter, flatten_state, wait_for_pending_episodes
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
 
 PANDA_FINGER_OPEN = 0.04
 """Finger joint position [m] of a fully open Panda hand."""
+
+
+@dataclass
+class EpisodeSummary:
+    """A finished episode as presented to :attr:`DashcamRecorder.episode_hook`, before it is saved or dropped."""
+
+    env_id: int
+    outcome: str
+    """``success`` or ``failure`` as decided by the task's termination terms."""
+    termination_terms: list[str]
+    meta: EpisodeMeta
+    writer: EpisodeWriter
+    extra: dict = field(default_factory=dict)
+    """Add entries here to store them in ``meta.json`` (``extra``)."""
+
+    @property
+    def data(self) -> dict[str, np.ndarray]:
+        """The episode's per-step arrays (see :data:`panda_al.episode_io.STEP_KEYS`)."""
+        return self.writer.arrays()
 
 
 class DashcamRecorder(RecorderTerm):
@@ -69,7 +88,10 @@ class DashcamRecorder(RecorderTerm):
         self.parent_episode: dict[int, str] = {}
         """Per env id: id of the episode the running one was derived from (replays)."""
         self.last_finished: dict[int, tuple[str, str | None]] = {}
-        """Per env id: (outcome, path) of the most recently finished episode, for driver scripts to report."""
+        """Per env id: (outcome, path) of the most recently finished episode, for driver scripts to report.
+        The outcome is the real one even if the episode was not saved (path ``None``)."""
+        self.episode_hook: Callable[[EpisodeSummary], bool] | None = None
+        """Called for every finished episode; return whether to save it (default: ``cfg.save_outcomes``)."""
 
     """
     Recorder callbacks.
@@ -111,7 +133,12 @@ class DashcamRecorder(RecorderTerm):
                 outcome = "success" if "success" in fired[env_id] else "failure"
             writer.meta.extra.update(self.episode_extra.pop(env_id, {}))
             writer.meta.parent_episode = self.parent_episode.pop(env_id, None)
-            path = writer.finalize(outcome, fired[env_id])
+            keep = outcome in self.cfg.save_outcomes
+            if self.episode_hook is not None and outcome != "discard":
+                summary = EpisodeSummary(env_id, outcome, fired[env_id], writer.meta, writer)
+                keep = self.episode_hook(summary)
+                writer.meta.extra.update(summary.extra)
+            path = writer.finalize(outcome if keep else "discard", fired[env_id])
             self.last_finished[env_id] = (outcome, str(path) if path else None)
             if path is not None:
                 print(f"[dashcam] env {env_id}: {outcome:<8} {writer.num_rows:4d} steps -> {path}")
@@ -122,6 +149,8 @@ class DashcamRecorder(RecorderTerm):
         for writer in self._writers.values():
             writer.finalize("discard")
         self._writers.clear()
+        for err in wait_for_pending_episodes():  # episodes still being encoded
+            print(f"[dashcam] failed to write an episode: {err!r}")
 
     """
     Helpers.
@@ -137,10 +166,13 @@ class DashcamRecorder(RecorderTerm):
     def _new_writer(self, env_id: int) -> EpisodeWriter:
         self._counter += 1
         episode_id = f"{time.strftime('%Y%m%d-%H%M%S')}_{self.cfg.source}_{self._tag}_{self._counter:05d}"
+        # multi-task envs publish the current episode's task and prompt per env as ``env.episode_info``
+        infos = getattr(self._env, "episode_info", None)
+        info = infos[env_id] if infos else None
         meta = EpisodeMeta(
             episode_id=episode_id,
             task=self.cfg.task_name,
-            instruction=self.cfg.instruction,
+            instruction=info["prompt"] if info else self.cfg.instruction,
             source=self.cfg.source,
             fps=self._fps,
             cameras=list(self.cfg.camera_names),
@@ -148,7 +180,9 @@ class DashcamRecorder(RecorderTerm):
             object_names=list(self.cfg.object_names),
             arm_joint_names=list(self._arm_names),
         )
-        writer = EpisodeWriter(self._run_dir, meta)
+        if info:
+            meta.extra["task"] = dict(info)
+        writer = EpisodeWriter(self._run_dir, meta, defer=self.cfg.defer_encoding)
         if env_id in self._initial_states:
             writer.set_initial_state(self._initial_states[env_id])
         return writer
@@ -237,6 +271,11 @@ class DashcamRecorderCfg(RecorderTermCfg):
     class_type: type[RecorderTerm] = DashcamRecorder
 
     enabled: bool = True
+    save_outcomes: list[str] = ["success", "failure"]
+    """Outcomes that are written to disk. The others are dropped when the episode ends (their frames are never
+    encoded when ``defer_encoding`` is on), but still reported through ``last_finished`` and ``episode_hook``."""
+    defer_encoding: bool = False
+    """Buffer frames in RAM and encode them in the background only for saved episodes (see ``EpisodeWriter``)."""
     output_dir: str = os.environ.get("AL_DATA_DIR", "/workspace/data") + "/episodes/default"
     """Run directory; driver scripts usually override it."""
     source: str = "unspecified"

@@ -1,0 +1,34 @@
+# Failure collection campaign, see docs/automated_collection.md. Run: ./al.sh collect configs/campaigns/example.yaml
+name: smolvla_iter0              # run directory: $AL_DATA_DIR/episodes/<name>/ (also holds stats.jsonl, manifest.jsonl)
+driver: policy                   # policy: a served VLA; expert: the scripted expert (dry run / baseline)
+env: PandaAL-MultiTask-v0
+num_envs: 8
+seed: 0
+
+policy:
+  host: 127.0.0.1                # or the Jetson Thor / another machine
+  port: 8000
+  adapter: native                # native (SmolVLA/LeRobot fine-tuned on our episodes) | droid (openpi pi05_droid)
+  open_loop_horizon: 8
+  batch: auto                    # one request per step for all envs that need actions (auto: if the server can)
+  jpeg_quality: 90               # images as JPEG over the wire; needed for a server on another machine (Gigabit)
+  label: smolvla_iter0           # checkpoint name, stored in every episode
+
+tasks:                           # task name: sampling weight (omit to use all tasks and their YAML weights)
+  stack: 1.0
+  beside_left: 1.0
+  beside_right: 1.0
+
+cameras: [exterior_1, exterior_2, wrist]   # recorded; only cameras that are read get rendered (the expensive part)
+depth: false
+
+perturbations:
+  obstacle: {probability: 0.1}   # cylinder between the cubes in 10 % of the episodes
+
+save:
+  outcomes: [failure]            # successes are dropped without being encoded
+  keep_success_fraction: 0.0
+  drop_tags: [stalled_at_start]  # failures with only these tags are not saved (they teach nothing)
+  quota: {per_task: 200, per_tag: 100}
+
+limits: {max_hours: 24, max_disk_gb: 100}

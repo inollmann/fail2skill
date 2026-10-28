@@ -3,21 +3,30 @@
 from __future__ import annotations
 
 import logging
+import threading
 import time
 import traceback
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Protocol
 
+import numpy as np
 from websockets.exceptions import ConnectionClosed
 from websockets.sync.client import connect
 from websockets.sync.server import ServerConnection, serve
 
 from . import msgpack_numpy
+from .adapters import decode_images
 
 logger = logging.getLogger(__name__)
 
 
 class Policy(Protocol):
-    """What :func:`serve_policy` serves: ``infer`` maps one observation dict to ``{"actions": (H, D), ...}``."""
+    """What :func:`serve_policy` serves: ``infer`` maps one observation dict to ``{"actions": (H, D), ...}``.
+
+    Optionally ``infer_batch`` maps a list of observation dicts to ``{"actions": (B, H, D), ...}`` in one model call
+    (otherwise the server calls ``infer`` once per observation). A batch must give each observation the same result as
+    a single call, i.e. the policy must not keep state between observations (chunk-based policies don't).
+    """
 
     metadata: dict[str, Any]
 
@@ -52,6 +61,18 @@ class PolicyClient:
             raise RuntimeError(f"Error in policy server:\n{response}")
         return msgpack_numpy.unpackb(response)
 
+    def infer_batch(self, observations: list[dict]) -> dict:
+        """Several observations in one request: ``{"actions": (B, H, D), "server_timing": ...}``.
+
+        Needs a server that announces ``batched`` in its metadata (ours do); openpi's own server does not.
+        """
+        if not self.metadata.get("batched"):
+            raise RuntimeError(f"The policy server at {self.uri} does not support batched requests")
+        response = self.infer({"batched": True, "observations": list(observations)})
+        if len(response["actions"]) != len(observations):
+            raise RuntimeError(f"Asked for {len(observations)} actions, got {len(response['actions'])}")
+        return response
+
     def close(self):
         self._conn.close()
 
@@ -59,17 +80,35 @@ class PolicyClient:
 def serve_policy(policy: Policy, host: str = "0.0.0.0", port: int = 8000):
     """Serve ``policy`` until interrupted. Each new connection resets the policy (one rollout per client)."""
     packer = msgpack_numpy.Packer()
+    model_lock = threading.Lock()  # several clients (e.g. one simulator per GPU) may share the model, one call at a time
+    metadata = {**policy.metadata, "batched": True}
+
+    decode_pool = ThreadPoolExecutor(max_workers=8, thread_name_prefix="jpeg")
+
+    def infer(obs: dict) -> dict:
+        obs = decode_images(obs, decode_pool)  # JPEG images (adapter.jpeg_quality) back to arrays
+        if obs.get("batched"):
+            items = obs["observations"]
+            if hasattr(policy, "infer_batch"):
+                result = policy.infer_batch(items)
+            else:  # no native batching: still saves the round trips
+                result = {"actions": np.stack([np.asarray(policy.infer(item)["actions"]) for item in items])}
+            result["batch_size"] = len(items)
+            return result
+        return policy.infer(obs)
 
     def handler(conn: ServerConnection):
         peer = conn.remote_address
         logger.info("client connected: %s", peer)
-        policy.reset()
-        conn.send(packer.pack(policy.metadata))
+        with model_lock:
+            policy.reset()
+        conn.send(packer.pack(metadata))
         while True:
             try:
                 obs = msgpack_numpy.unpackb(conn.recv())
                 start = time.monotonic()
-                result = policy.infer(obs)
+                with model_lock:
+                    result = infer(obs)
                 result["server_timing"] = {"infer_ms": (time.monotonic() - start) * 1000.0}
                 conn.send(packer.pack(result))
             except ConnectionClosed:

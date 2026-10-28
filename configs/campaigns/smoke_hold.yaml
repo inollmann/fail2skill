@@ -1,0 +1,13 @@
+# Plumbing test with the "hold still" policy (./al.sh serve hold --port 8123): every episode fails.
+name: smoke_hold
+driver: policy
+num_envs: 4
+policy: {port: 8123, adapter: native, label: hold, reconnect_attempts: 2}
+tasks: {stack: 1.0, beside_left: 1.0}
+perturbations:
+  obstacle: {probability: 0.25}
+save:
+  outcomes: [failure]
+  drop_tags: []
+  quota: {per_task: 2}
+limits: {max_episodes: 40}

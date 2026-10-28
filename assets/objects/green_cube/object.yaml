@@ -1,0 +1,9 @@
+# Manipulable object, see docs/automated_collection.md. Add a folder like this to make a new object available.
+name: green_cube
+noun: cube                   # used in prompts: "the green cube"
+color: green
+usd_path: "{ISAAC_NUCLEUS_DIR}/Props/Blocks/green_block.usd"   # or a path relative to this folder
+scale: [1.0, 1.0, 1.0]
+size: [0.0468, 0.0468, 0.0468]   # bounding box [m] at that scale: stack heights, resting height
+roles: [pick, place, distractor]
+# optional: mass [kg], static_friction, dynamic_friction, spawn_height [m] (default: size z / 2 + 0.6 mm)

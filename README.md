@@ -12,7 +12,7 @@ in **Isaac Lab 3.0 / Isaac Sim 6.2**:
 * **Replay**: re-execute any action sequence (e.g. one proposed by Cosmos) from a failed episode's initial
   state. The simulator decides whether the "fixed" episode really succeeds.
 
-Everything runs in Docker. See [cosmos/README.md](cosmos/README.md) for how the data maps onto Cosmos 3.
+Everything runs in Docker. **Continuing this work? Start with [docs/HANDOVER.md](docs/HANDOVER.md).** See [cosmos/README.md](cosmos/README.md) for how the data maps onto Cosmos 3.
 
 ```text
  ┌──────────── sim container (Isaac Lab, Python 3.12) ────────────┐     ┌──── ros container (Humble) ─────┐
@@ -78,6 +78,69 @@ The failure modes are defined in `CORRUPTION_MODES` in `src/panda_al/scripted.py
 are stored in each episode's `meta.json`. A corrupted episode that still succeeds is filed as a success,
 because the label always comes from the simulator, not from the injected corruption.
 
+### Multi-task environment (objects, tasks, prompts)
+
+`PandaAL-MultiTask-v0` draws a task, its objects, their poses and a language prompt per env at every reset, from two
+registries that are plain files (see [docs/automated_collection.md](docs/automated_collection.md)):
+
+* `assets/objects/<name>/object.yaml`: one folder per object (USD, noun and color for prompts, size, optional mass and
+  friction). **Adding an asset = adding a folder.**
+* `configs/tasks/<name>.yaml`: goal (`stack`, `beside` left/right), filters for the pick and place objects, prompt
+  templates such as `"put the {pick.color} {pick.noun} on top of the {place.color} {place.noun}"`, time limit, weight.
+
+```bash
+./al.sh registry                                        # validate both and list what they define
+./al.sh generate --task PandaAL-MultiTask-v0 --num_envs 8 --num_episodes 100 --run_name multitask
+./al.sh replay --episodes data/episodes/multitask/failure/*   # picks the right env and task by itself
+```
+
+Each episode's `meta.json` has the prompt as `instruction` and the task details under `extra.task` (task, prompt,
+pick/place object, goal, objects on the table). The original `PandaAL-PickPlace-v0` is unchanged.
+`scripts/benchmark_sim.py` and `scripts/benchmark_policy.py` measure simulator throughput and policy latency.
+
+### Unattended failure collection (VLA in the loop)
+
+`./al.sh collect <campaign.yaml>` lets an array of robots work through the multi-task env, controlled by a served
+policy, and keeps **only the failures** (for Cosmos 3). Everything is set in a campaign file
+([configs/campaigns/example.yaml](configs/campaigns/example.yaml)): policy server and adapter, task weights, cameras,
+obstacle probability, what to save, quotas and limits. Plan and design: [docs/automated_collection.md](docs/automated_collection.md).
+
+```bash
+./al.sh serve lerobot --checkpoint <dir|repo> &      # or openpi's serve_policy.py, here or on the Jetson Thor
+./al.sh collect configs/campaigns/example.yaml       # runs for hours; Ctrl-C to stop, run again to continue
+./al.sh collect configs/campaigns/dryrun_expert.yaml # pipeline test without any VLA (scripted expert as the "policy")
+```
+
+* Every finished episode is judged by the simulator; successes are dropped **without being encoded** (frames are
+  buffered in RAM and only failures are written, by background threads).
+* Failures get automatic tags: `stalled_at_start`, `no_grasp`, `dropped`, `misplaced`, `collision`, `knocked_off`,
+  `timeout` (in `meta.json` → `extra.failure_tags`). Failures with only `drop_tags` (default `stalled_at_start`)
+  are not saved, and per-task / per-tag quotas keep one failure type from dominating.
+* The run directory `$AL_DATA/episodes/<name>/` contains the episodes plus `manifest.jsonl` (saved episodes: task,
+  prompt, tags, checkpoint label, path) and `stats.jsonl` (all episodes including successes, for per-task success
+  rates, which are the weakness signal for the next fine-tuning round).
+* Robust by design: the same command resumes from `stats.jsonl`/`manifest.jsonl`; a crashed simulator is restarted
+  (`AL_COLLECT_MAX_RESTARTS`, default 20); a lost policy server is re-tried for about a minute, then the run stops
+  and the supervisor tries again after 30 s.
+* Rendering is the cost driver: every camera in the scene costs about 40 ms per control step and 2 GB of GPU memory at
+  16 envs. List only the cameras you need in `cameras:`; all others (except the ones the policy adapter reads) are
+  removed from the scene.
+
+### Fine-tuning a policy on demonstrations
+
+```bash
+./al.sh collect configs/campaigns/demos.yaml                                      # 450 scripted demonstrations (13 min)
+./al.sh export-lerobot --source data/episodes/demos --out data/lerobot/demos_v0   # LeRobotDataset (slow: ~25 min)
+./al.sh train --dataset data/lerobot/demos_v0 --name smolvla_iter0 --steps 8000    # prints the serve command at the end
+./al.sh serve lerobot --checkpoint /workspace/data/checkpoints/smolvla_iter0/checkpoints/last/pretrained_model ...
+./al.sh collect configs/campaigns/eval_smolvla.yaml && ./al.sh report data/episodes/eval_smolvla_iter0
+```
+
+`--source <run dir>:3` in `export-lerobot` counts that source three times (extra weight for the failure cases that Cosmos
+turned into verified successes). Checkpoints are written every 2000 steps; serve and evaluate earlier ones the same way
+to get a ladder of competence. First result (8000 steps): 2 % success, the gripper reaches the cubes but misses them by a
+median 8 cm, see [docs/automated_collection.md](docs/automated_collection.md).
+
 ### Obstacle failures
 
 The corruption mode `obstacle_cylinder` stands a static cylinder (height 0.18 m, radius = cube side / 2) on the
@@ -128,6 +191,14 @@ uv run scripts/serve_policy.py policy:checkpoint --policy.config=pi05_droid \
 
 The policy server can run on another machine (e.g. the H100 server; policies need no RT cores): set
 `AL_POLICY_HOST` / `AL_POLICY_PORT` in `docker/.env.local` or pass `--host` / `--port`.
+
+**Batching**: our servers (`./al.sh serve lerobot|openpi|hold`) also answer *batched* requests, one model call for many
+envs (`PolicyClient.infer_batch`; the collector does this automatically). SmolVLA: 99 ms for one env, 367 ms for 16.
+A policy must keep no state between observations for this (chunk-based policies don't). For a server on another
+machine set `jpeg_quality: 90` (campaign) so images travel as JPEG (30x smaller). openpi's own `serve_policy.py`
+answers single requests only; to batch pi0.5, run `python -m panda_al.policy.serve openpi --config pi05_droid
+--checkpoint gs://openpi-assets/checkpoints/pi05_droid` from an openpi checkout with this repo's `src/` on the
+`PYTHONPATH` (this wrapper has not been tested against real pi0.5 weights yet).
 
 The **adapter** translates between the simulator and a policy family (`src/panda_al/policy/adapters.py`):
 

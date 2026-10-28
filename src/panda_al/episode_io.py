@@ -30,6 +30,8 @@ import os
 import queue
 import shutil
 import threading
+from collections.abc import Callable
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
@@ -157,23 +159,65 @@ class DepthStream:
         self._container.close()
 
 
+_ENCODER: ThreadPoolExecutor | None = None
+_PENDING: list[Future] = []
+_PENDING_LOCK = threading.Lock()
+_DEFERRED_BYTES = 0
+
+
+def _submit_encode(fn, *args) -> Future:
+    """Run ``fn`` on the shared encoder pool (``AL_ENCODE_WORKERS`` threads, default 4)."""
+    global _ENCODER
+    if _ENCODER is None:
+        _ENCODER = ThreadPoolExecutor(max_workers=int(os.environ.get("AL_ENCODE_WORKERS", "4")), thread_name_prefix="enc")
+    future = _ENCODER.submit(fn, *args)
+    with _PENDING_LOCK:
+        _PENDING.append(future)
+    return future
+
+
+def wait_for_pending_episodes() -> list[BaseException]:
+    """Block until all episodes handed to the encoder pool are on disk. Returns the errors that occurred."""
+    with _PENDING_LOCK:
+        futures, _PENDING[:] = list(_PENDING), []
+    return [err for f in futures if (err := f.exception()) is not None]
+
+
+def deferred_buffer_bytes() -> int:
+    """Raw frame bytes currently buffered by deferred writers (RAM)."""
+    return _DEFERRED_BYTES
+
+
 class EpisodeWriter:
     """Writes one episode into ``<run_dir>/in_progress/<id>`` and moves it on :meth:`finalize`.
 
     Video encoding runs on a background thread so the simulation loop only pays for the
     GPU -> CPU copy of the frames.
+
+    With ``defer=True`` nothing is encoded or written while the episode runs: the raw frames are buffered in RAM, and
+    :meth:`finalize` either drops them (``discard``: no CPU spent on episodes that are not kept) or hands them to the
+    shared encoder pool, so the simulation does not wait for the encoding. ``finalize`` then returns the path the
+    episode will have; call :func:`wait_for_pending_episodes` before reading it (or exiting).
     """
 
-    def __init__(self, run_dir: str | os.PathLike, meta: EpisodeMeta, max_queue: int = 64):
+    def __init__(self, run_dir: str | os.PathLike, meta: EpisodeMeta, max_queue: int = 64, defer: bool = False):
         self.run_dir = Path(run_dir)
         self.meta = meta
         self.dir = self.run_dir / IN_PROGRESS_DIR / meta.episode_id
-        (self.dir / "videos").mkdir(parents=True, exist_ok=True)
+        self._defer = defer
         self._steps: dict[str, list[np.ndarray]] = {}
         self._rows = 0
         self._videos: dict[str, VideoStream | DepthStream] = {}
-        self._queue: queue.Queue = queue.Queue(maxsize=max_queue)
         self._error: BaseException | None = None
+        self._initial_state: dict[str, np.ndarray] | None = None
+        self.on_saved: Callable[[Path], None] | None = None
+        """Called with the episode's final path once it is complete on disk (from an encoder thread if deferred)."""
+        self._frames: list[tuple[dict[str, np.ndarray], dict[str, np.ndarray]]] = []
+        self._buffered = 0
+        if defer:
+            return
+        (self.dir / "videos").mkdir(parents=True, exist_ok=True)
+        self._queue: queue.Queue = queue.Queue(maxsize=max_queue)
         self._thread = threading.Thread(target=self._encode_loop, daemon=True)
         self._thread.start()
 
@@ -182,7 +226,14 @@ class EpisodeWriter:
         return self._rows
 
     def set_initial_state(self, state: dict[str, np.ndarray]):
-        np.savez_compressed(self.dir / "initial_state.npz", **state)
+        if self._defer:
+            self._initial_state = state
+        else:
+            np.savez_compressed(self.dir / "initial_state.npz", **state)
+
+    def arrays(self) -> dict[str, np.ndarray]:
+        """The per-step arrays recorded so far, stacked along time (for judging the episode before it is saved)."""
+        return {key: np.stack(values) for key, values in self._steps.items()}
 
     def append(
         self,
@@ -196,6 +247,13 @@ class EpisodeWriter:
         for key, value in step.items():
             self._steps.setdefault(key, []).append(np.asarray(value))
         self._rows += 1
+        if self._defer:
+            # copies: the inputs are views of a batch array that holds the frames of all envs
+            frames = {name: np.array(f) for name, f in frames.items()}
+            depth = {name: np.array(d) for name, d in (depth or {}).items()}
+            self._frames.append((frames, depth))
+            self._add_buffered(sum(a.nbytes for a in [*frames.values(), *depth.values()]))
+            return
         self._queue.put((frames, depth or {}))
 
     def _encode_loop(self):
@@ -228,23 +286,79 @@ class EpisodeWriter:
         if self._error is not None:
             raise RuntimeError(f"Video encoding failed for episode {self.meta.episode_id}") from self._error
 
-    def finalize(self, outcome: str, termination_terms: list[str] | None = None) -> Path | None:
-        """Flush everything and move the episode to ``success/`` or ``failure/`` (or delete it on ``discard``)."""
-        self._close_videos()
-        if outcome == "discard" or self.num_rows == 0:
-            shutil.rmtree(self.dir, ignore_errors=True)
-            return None
-        arrays = {key: np.stack(values) for key, values in self._steps.items()}
-        np.savez_compressed(self.dir / "data.npz", **arrays)
+    def _add_buffered(self, nbytes: int):
+        global _DEFERRED_BYTES
+        self._buffered += nbytes
+        with _PENDING_LOCK:
+            _DEFERRED_BYTES += nbytes
+
+    def _release_buffered(self):
+        global _DEFERRED_BYTES
+        with _PENDING_LOCK:
+            _DEFERRED_BYTES -= self._buffered
+        self._buffered = 0
+        self._frames = []
+
+    def _commit(self, outcome: str, termination_terms: list[str] | None) -> Path:
+        """Write data.npz and meta.json into the episode directory and move it to ``success/`` or ``failure/``."""
+        np.savez_compressed(self.dir / "data.npz", **self.arrays())
         self.meta.success = outcome == "success"
         self.meta.outcome = outcome
         self.meta.termination_terms = list(termination_terms or [])
         self.meta.num_steps = self.num_rows
         (self.dir / "meta.json").write_text(json.dumps(asdict(self.meta), indent=2))
-        target = self.run_dir / (SUCCESS_DIR if outcome == "success" else FAILURE_DIR) / self.meta.episode_id
+        target = self.target_path(outcome)
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.move(str(self.dir), target)
+        if self.on_saved is not None:
+            self.on_saved(target)
         return target
+
+    def target_path(self, outcome: str) -> Path:
+        return self.run_dir / (SUCCESS_DIR if outcome == "success" else FAILURE_DIR) / self.meta.episode_id
+
+    def _write_deferred(self, outcome: str, termination_terms: list[str] | None) -> Path:
+        """Encoder-pool job of a deferred episode: encode the buffered frames, then commit."""
+        (self.dir / "videos").mkdir(parents=True, exist_ok=True)
+        try:
+            streams: dict[str, VideoStream | DepthStream] = {}
+            for frames, depth in self._frames:
+                for name, mm in depth.items():
+                    if f"{name}_depth" not in streams:
+                        h, w = mm.shape[:2]
+                        streams[f"{name}_depth"] = DepthStream(
+                            self.dir / "videos" / f"{name}_depth.mkv", self.meta.fps, w, h
+                        )
+                    streams[f"{name}_depth"].write(mm)
+                for name, rgb in frames.items():
+                    if name not in streams:
+                        h, w = rgb.shape[:2]
+                        streams[name] = VideoStream(self.dir / "videos" / f"{name}.mp4", self.meta.fps, w, h)
+                    streams[name].write(rgb)
+            for stream in streams.values():
+                stream.close()
+            if self._initial_state is not None:
+                np.savez_compressed(self.dir / "initial_state.npz", **self._initial_state)
+            return self._commit(outcome, termination_terms)
+        except BaseException:
+            shutil.rmtree(self.dir, ignore_errors=True)
+            raise
+        finally:
+            self._release_buffered()
+
+    def finalize(self, outcome: str, termination_terms: list[str] | None = None) -> Path | None:
+        """Flush everything and move the episode to ``success/`` or ``failure/`` (or delete it on ``discard``)."""
+        if self._defer:
+            if outcome == "discard" or self.num_rows == 0:
+                self._release_buffered()
+                return None
+            _submit_encode(self._write_deferred, outcome, termination_terms)
+            return self.target_path(outcome)
+        self._close_videos()
+        if outcome == "discard" or self.num_rows == 0:
+            shutil.rmtree(self.dir, ignore_errors=True)
+            return None
+        return self._commit(outcome, termination_terms)
 
 
 @dataclass

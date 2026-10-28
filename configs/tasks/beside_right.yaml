@@ -1,0 +1,10 @@
+name: beside_right
+goal: {type: beside, direction: right, distance: 0.10}
+pick: {noun: cube}
+place: {noun: cube}
+distractors: [0, 1]
+time_limit_s: 20
+weight: 1.0
+prompts:
+  - "put the {pick.color} {pick.noun} to the right of the {place.color} {place.noun}"
+  - "move the {pick.color} {pick.noun} next to the {place.color} {place.noun}, on its right side"
